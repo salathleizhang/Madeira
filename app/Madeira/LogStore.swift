@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Darwin
 
 final class LogStore: ObservableObject {
     static let shared = LogStore()
@@ -156,6 +157,9 @@ final class LogStore: ObservableObject {
             LogStore.shared.log("[thermal] now \(DeviceLoadDiagnostics.thermalName(process.thermalState)) "
                                 + "(low-power=\(process.isLowPowerModeEnabled ? 1 : 0))")
         }
+
+        // DeckRT: the M0 measurement probe (see the DeckRTProbe section below).
+        DeckRTProbe.boot()
     }
 
     /// Documents/madeira-log.txt, this run's log.
@@ -389,5 +393,237 @@ final class LogStore: ObservableObject {
                 handle.closeFile()
             }
         }
+    }
+}
+
+// MARK: - DeckRT measurement probe
+//
+// DeckRT's M0 measurement overlay (docs/measurements/M0.md). It writes one JSON
+// object per line to Documents/deckrt/measure.jsonl so the host script
+// (tools/measure.sh) can pull it with `xcrun devicectl device copy from` and
+// report launch-to-first-frame, phys_footprint peak and thermal transitions
+// without attaching a debugger. It changes no gameplay behaviour: the sampler is
+// a main-queue timer (0.25 s while a launch is pending, then 2 s), and writes are
+// append-only on a utility queue. It is DeckRT's own addition to the Madeira
+// fork; upstream does not have it.
+
+enum DeckRTProbe {
+    private static let schemaVersion = 1
+
+    private static let ioQueue = DispatchQueue(label: "deckrt.probe.io", qos: .utility)
+
+    private static var timer: DispatchSourceTimer?
+    private static var fileHandle: FileHandle?
+
+    private static var sessionID: String?
+    private static var sessionTitle = ""
+    private static var sessionStart = Date()
+    private static var frameBaseline: UInt64 = 0
+    private static var lastFrames: UInt64 = 0
+    private static var lastTick = Date()
+    private static var sawFirstFrame = false
+    private static var launchSlowNoted = false
+    private static var interval: Double = 0.25
+    private static var peakRSS = 0
+    private static var peakVirtual = 0
+    private static var thermalWorst = 0
+    private static var sampleSeq = 0
+
+    private static func fileURL() -> URL? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let dir = docs.appendingPathComponent("deckrt", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("measure.jsonl")
+    }
+
+    private static func iso(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func machine() -> String {
+        var size = 0
+        guard sysctlbyname("hw.machine", nil, &size, nil, 0) == 0, size > 0 else { return "unknown" }
+        var value = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.machine", &value, &size, nil, 0) == 0 else { return "unknown" }
+        return String(cString: value)
+    }
+
+    /// phys_footprint is the number jetsam judges the app on (FPSOverlay's
+    /// `readFootprintMB` reads the same task_info field); virtual_size is the
+    /// mapped address space, which is what grows when the FEX arena and JIT pool
+    /// are mapped.
+    private static func vm() -> (rssMB: Int, virtMB: Int) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { raw in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), raw, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return (0, 0) }
+        return (Int(info.phys_footprint / 1_048_576), Int(info.virtual_size / 1_048_576))
+    }
+
+    private static func jsonInt(_ value: Int?) -> Any {
+        value.map { $0 as Any } ?? NSNull()
+    }
+
+    private static func write(_ event: [String: Any]) {
+        guard let url = fileURL() else { return }
+        var payload = event
+        payload["schema"] = schemaVersion
+        payload["at"] = iso(Date())
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
+        ioQueue.async {
+            if fileHandle == nil {
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                fileHandle = try? FileHandle(forWritingTo: url)
+                fileHandle?.seekToEnd()
+            }
+            guard let handle = fileHandle else { return }
+            var line = data
+            line.append(0x0A)
+            try? handle.write(contentsOf: line)
+        }
+    }
+
+    /// Called once when the app's log store is built, i.e. at app launch.
+    static func boot() {
+        let (rss, virt) = vm()
+        write([
+            "event": "app_boot",
+            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
+            "build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?",
+            "ios": UIDevice.current.systemVersion,
+            "model": machine(),
+            "rss_mb": rss,
+            "virtual_mb": virt,
+            "thermal": ProcessInfo.processInfo.thermalState.rawValue,
+            "extended_va": checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing"),
+            "increased_memory": checkAppEntitlement("com.apple.developer.kernel.increased-memory-limit"),
+            "debugger": isDebuggerAttached()
+        ])
+    }
+
+    /// Called from `LibraryController.begin`, immediately after `launchStarted`.
+    /// That is the tap: the elapsed time to `first_frame` is the plan's first-frame metric.
+    static func sessionBegin(title: String, steamID: Int?, bits: Int, entryID: String) {
+        sessionID = UUID().uuidString
+        sessionTitle = title
+        sessionStart = Date()
+        frameBaseline = madeira_shown_frame_count()
+        lastFrames = frameBaseline
+        lastTick = sessionStart
+        sawFirstFrame = false
+        launchSlowNoted = false
+        interval = 0.25
+        sampleSeq = 0
+        let (rss, virt) = vm()
+        peakRSS = rss
+        peakVirtual = virt
+        thermalWorst = ProcessInfo.processInfo.thermalState.rawValue
+        let pool = JITPoolMeter.current
+        write([
+            "event": "session_begin",
+            "session": sessionID ?? "",
+            "game": title,
+            "steam_app_id": jsonInt(steamID),
+            "bits": bits,
+            "entry": entryID,
+            "rss_mb": rss,
+            "virtual_mb": virt,
+            "thermal": thermalWorst,
+            "jit_pool_mb": jsonInt(pool.sizeMB),
+            "jit_pool_used": Int(pool.used),
+            "jit_pool_exhausted": pool.exhausted,
+            "frames": frameBaseline
+        ])
+        startTimer(interval)
+    }
+
+    /// Called from `LibraryController.finish`.
+    static func sessionEnd(reason: String) {
+        guard let sid = sessionID else { return }
+        timer?.cancel()
+        timer = nil
+        let (rss, virt) = vm()
+        write([
+            "event": "session_end",
+            "session": sid,
+            "game": sessionTitle,
+            "reason": reason,
+            "elapsed_ms": Int(Date().timeIntervalSince(sessionStart) * 1000),
+            "rss_mb": rss,
+            "virtual_mb": virt,
+            "peak_rss_mb": peakRSS,
+            "peak_virtual_mb": peakVirtual,
+            "thermal_worst": thermalWorst,
+            "saw_first_frame": sawFirstFrame
+        ])
+        sessionID = nil
+    }
+
+    private static func startTimer(_ seconds: Double) {
+        timer?.cancel()
+        let source = DispatchSource.makeTimerSource(queue: .main)
+        source.schedule(deadline: .now() + seconds, repeating: seconds, leeway: .milliseconds(50))
+        source.setEventHandler { tick() }
+        source.resume()
+        timer = source
+    }
+
+    private static func tick() {
+        let now = Date()
+        let frames = madeira_shown_frame_count()
+        let elapsed = now.timeIntervalSince(lastTick)
+        let frameDelta = frames &- lastFrames
+        let (rss, virt) = vm()
+        if rss > peakRSS { peakRSS = rss }
+        if virt > peakVirtual { peakVirtual = virt }
+        let thermal = ProcessInfo.processInfo.thermalState.rawValue
+        if thermal > thermalWorst { thermalWorst = thermal }
+        lastFrames = frames
+        lastTick = now
+
+        guard let sid = sessionID else { return }
+
+        let sinceBegin = now.timeIntervalSince(sessionStart)
+        if !sawFirstFrame, frames >= frameBaseline + 1 {
+            sawFirstFrame = true
+            write([
+                "event": "first_frame",
+                "session": sid,
+                "game": sessionTitle,
+                "elapsed_ms": Int(sinceBegin * 1000),
+                "sampling_ms": Int(interval * 1000)
+            ])
+            interval = 2.0
+            startTimer(interval)
+        } else if !sawFirstFrame, !launchSlowNoted, sinceBegin > 30 {
+            launchSlowNoted = true
+            write([
+                "event": "launch_slow",
+                "session": sid,
+                "game": sessionTitle,
+                "elapsed_ms": Int(sinceBegin * 1000)
+            ])
+        }
+
+        sampleSeq += 1
+        write([
+            "event": "sample",
+            "session": sid,
+            "n": sampleSeq,
+            "rss_mb": rss,
+            "virtual_mb": virt,
+            "thermal": thermal,
+            "frames": frames,
+            "fps": elapsed > 0 ? Double(frameDelta) / elapsed : 0,
+            "elapsed_ms": Int(sinceBegin * 1000)
+        ])
     }
 }

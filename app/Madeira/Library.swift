@@ -1711,6 +1711,8 @@ final class LibraryModel: ObservableObject {
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_frame_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
+        // DeckRT: the tap that starts a session is the first-frame metric's zero (docs/measurements/M0.md).
+        DeckRTProbe.sessionBegin(title: entry.title, steamID: entry.steamID, bits: entry.bits, entryID: entry.id.uuidString)
         launchSurface = winios_surface_present_count()
         MetalBackedView.presentCountAtLaunch = launchPresent; laidOutAfterFirstPresent = false
         preparing = nil; launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
@@ -1906,6 +1908,7 @@ final class LibraryModel: ObservableObject {
         }
     }
     private func finish() {
+        DeckRTProbe.sessionEnd(reason: "finish")
         if sawProcess, let next = steamRunRequest() { restartNotice = next }
         else if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
