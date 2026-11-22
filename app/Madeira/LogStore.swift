@@ -482,7 +482,7 @@ enum DeckRTProbe {
                     FileManager.default.createFile(atPath: url.path, contents: nil)
                 }
                 fileHandle = try? FileHandle(forWritingTo: url)
-                fileHandle?.seekToEnd()
+                try? fileHandle?.seekToEnd()
             }
             guard let handle = fileHandle else { return }
             var line = data
