@@ -436,10 +436,18 @@ enum DeckRTProbe {
         return dir.appendingPathComponent("measure.jsonl")
     }
 
+    /// UTC timestamp built with strftime/gmtime_r, not NSISO8601DateFormatter.
+    /// Making a formatter per event crashed in ICU on 2026-11-23 14:27
+    /// (EXC_BAD_ACCESS inside udat_open from NSISO8601DateFormatter.init, main
+    /// thread, deckrt probe), which killed the app a second into a launch.
     private static func iso(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        let ms = Int(date.timeIntervalSince1970 * 1000)
+        var seconds = time_t(ms / 1000)
+        var broken = tm()
+        gmtime_r(&seconds, &broken)
+        var out = [CChar](repeating: 0, count: 40)
+        strftime(&out, 40, "%Y-%m-%dT%H:%M:%S", &broken)
+        return String(cString: out) + String(format: ".%03dZ", ms % 1000)
     }
 
     private static func machine() -> String {
