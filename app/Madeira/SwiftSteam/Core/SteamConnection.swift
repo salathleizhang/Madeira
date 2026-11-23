@@ -135,11 +135,20 @@ actor SteamConnection {
         // Verify the connection completed (WebSocket handshake + ping round-trip)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                // URLSessionWebSocketTask.sendPing's completion handler is not
+                // documented to run exactly once, and on iOS 27 it reported the
+                // same failure twice when the handshake timed out. A second
+                // resume traps CheckedContinuation and kills the process:
+                // "CheckedContinuation.resume(throwing:)" ← _assertionFailure, on
+                // the NSURLSession-delegate queue (crash reports 14:05 and 14:40,
+                // 2026-11-23). ResumeThroughOnce makes the first answer win; a
+                // later one is logged and dropped.
+                let once = ResumeThroughOnce(cont)
                 task.sendPing { error in
                     if let error {
-                        cont.resume(throwing: error)
+                        once.fail(error)
                     } else {
-                        cont.resume()
+                        once.succeed()
                     }
                 }
             }
@@ -244,5 +253,45 @@ actor SteamConnection {
         }
         disconnect()
         try await connect()
+    }
+}
+
+
+/// Resumes a continuation at most once, from any thread.
+///
+/// A single-shot continuation resumed twice is a program error Swift traps on
+/// rather than tolerates, so a callback that can answer more than once (URLSession
+/// completion handlers under cancellation and failure) has to be funnelled through
+/// this. The first answer is taken; later ones are logged and dropped.
+private final class ResumeThroughOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<Void, Error>?
+
+    init(_ cont: CheckedContinuation<Void, Error>) {
+        self.cont = cont
+    }
+
+    func succeed() {
+        lock.lock()
+        let pending = cont
+        cont = nil
+        lock.unlock()
+        guard let pending else {
+            SteamLog.event("[steam-cm-transport] duplicate continuation answer dropped (success)")
+            return
+        }
+        pending.resume()
+    }
+
+    func fail(_ error: Error) {
+        lock.lock()
+        let pending = cont
+        cont = nil
+        lock.unlock()
+        guard let pending else {
+            SteamLog.event("[steam-cm-transport] duplicate continuation answer dropped (failure)")
+            return
+        }
+        pending.resume(throwing: error)
     }
 }
