@@ -139,7 +139,7 @@ final class DepotDownloader {
             guard let gid = depot.manifestID(app.branch) else { continue }
             let key: Data
             do {
-                key = try await depotKey(depotID: depot.depotID, appID: app.appID)
+                key = try await depotKeyFor(depot, app: app)
             } catch SteamError.depotKeyNotFound(let refused) where depot.dlcAppID != nil {
                 // Owned DLC Steam still refuses a key for is left out; the game installs without it.
                 licenseSkipped.append(refused)
@@ -1068,6 +1068,32 @@ final class DepotDownloader {
     }
 
     // MARK: - Depot Key
+
+    /// Valve validates the app id against the depot it decrypts, and a demo's
+    /// depots can belong to the full game: `fromApp` names it, and the app's
+    /// `parentID` names the demo's full game. A key refused for the demo's own
+    /// id is therefore tried once under that owner before the download gives
+    /// up, and the answer is logged so a device run shows which id worked.
+    ///
+    /// DeckRT: on 2026-11-23 a demo (app 3553960, parent 3500630) had its depot
+    /// 3553961 listed in the account's license, yet the key was refused with
+    /// eresult=15 for the demo's own id, which failed the install.
+    private func depotKeyFor(_ depot: SteamAppInfo.DepotInfo, app: SteamAppInfo) async throws -> Data {
+        do {
+            return try await depotKey(depotID: depot.depotID, appID: app.appID)
+        } catch SteamError.depotKeyNotFound(let refused) {
+            var owners: [UInt32] = []
+            if let owner = depot.fromApp, owner != app.appID { owners.append(owner) }
+            if let parent = app.parentID, parent != app.appID, !owners.contains(parent) { owners.append(parent) }
+            for owner in owners {
+                if let key = try? await depotKey(depotID: depot.depotID, appID: owner) {
+                    SteamLog.event("[steam-depot] depot-key via owner app=\(app.appID) owner=\(owner) depot=\(depot.depotID) refused=\(refused)")
+                    return key
+                }
+            }
+            throw SteamError.depotKeyNotFound(refused)
+        }
+    }
 
     private func depotKey(depotID: UInt32, appID: UInt32) async throws -> Data {
         if let cached = depotKeys[depotID] { return cached }
