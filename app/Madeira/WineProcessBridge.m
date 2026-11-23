@@ -1801,6 +1801,28 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        /* DeckRT diagnostics: dump the environment the guest will inherit.
+         * FEX's ProcessInit reads this block (its Config loader walks the
+         * entries), and a malformed entry would make that loader take a path
+         * that ends in msvcrt's invalid-parameter handler — observed as
+         * "msvcrt:_invalid_parameter ... c0000417" on iOS 27.
+         * env.MADEIRA_ENV_DUMP = 1 turns it on; each entry carries its length
+         * so a truncated or malformed one is visible. */
+        if (getenv("MADEIRA_ENV_DUMP")) {
+            extern char **environ;
+            int dumped = 0, malformed = 0;
+            for (char **e = environ; e && *e; e++) {
+                const char *eq = strchr(*e, '=');
+                if (!eq) malformed++;
+                if (dumped < 400) {
+                    LOG("[env-dump] len=%zu%s %{public}s", strlen(*e),
+                        eq ? "" : " NO-EQUALS", *e);
+                    dumped++;
+                }
+            }
+            LOG("[env-dump] entries=%d malformed=%d", dumped, malformed);
+        }
+
         /* iOS-Madeira: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
          * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which
          * replicates FEX's HandleUnalignedAccess (Arm64.cpp:2072) so iOS
