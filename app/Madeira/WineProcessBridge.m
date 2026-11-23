@@ -2806,6 +2806,38 @@ int wine_process_start(const char *prefix_path) {
 
     LOG("Starting Wine process with prefix: %{public}s", prefix_path);
 
+    /* DeckRT diagnostics: report the shape of the environment block the guest
+     * inherits. FEX's ProcessInit parses this block, and an entry without '='
+     * is the one shape it cannot parse; the failure this investigation is
+     * chasing ends in msvcrt:_invalid_parameter -> c0000417. Printed to stderr
+     * because that is what reaches the app log on this launch path ([WineProc]
+     * lines do, LOG() here does not). */
+    {
+        extern char **environ;
+        int total = 0, malformed = 0;
+        for (char **e = environ; e && *e; e++) {
+            total++;
+            if (!strchr(*e, '=')) {
+                malformed++;
+                dprintf(STDERR_FILENO, "[env-shape] NO-EQUALS: %.120s\n", *e);
+            }
+        }
+        dprintf(STDERR_FILENO, "[env-shape] entries=%d malformed=%d\n", total, malformed);
+        /* The dual-map geometry FEX derives its write offset from. Printing it
+         * here lets a failing run be compared with a working one without a
+         * debugger: the offset is computed as RW - RX, and a mismatch corrupts
+         * the JIT pool on write. */
+        {
+            static const char *const jit_names[] = {"WINE_IOS_JIT_RX", "WINE_IOS_JIT_RW",
+                                                    "WINE_IOS_JIT_SIZE",
+                                                    "MADEIRA_JIT_WRITE_OFFSET"};
+            for (unsigned i = 0; i < sizeof(jit_names) / sizeof(jit_names[0]); i++) {
+                const char *v = getenv(jit_names[i]);
+                dprintf(STDERR_FILENO, "[env-shape] %s=%s\n", jit_names[i], v ? v : "(unset)");
+            }
+        }
+    }
+
     g_wine_running = 1;
 
     // Create socketpair to bypass broken iOS UDS accept()
