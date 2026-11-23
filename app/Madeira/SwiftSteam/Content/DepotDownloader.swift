@@ -149,7 +149,16 @@ final class DepotDownloader {
                 // include is content this account does not own (another
                 // edition, extra content): it is left out. Any other refusal
                 // still fails.
-                if let owned = await ownedDepots(), !owned.isEmpty, !owned.contains(refused) {
+                //
+                // DeckRT: log what the license said. A refusal whose license
+                // lookup itself failed (nil) told us nothing; the demo at
+                // 2026-11-23 13:52 failed exactly here.
+                let licensed = await ownedDepots()
+                SteamLog.event("[steam-depot] key-refused app=\(app.appID) depot=\(refused) "
+                    + "licensed=\(licensed.map { String($0.count) } ?? "nil") "
+                    + "contains=\(licensed.map { $0.contains(refused) ? "1" : "0" } ?? "nil") "
+                    + "fromApp=\(depot.fromApp.map(String.init) ?? "-") parent=\(app.parentID.map(String.init) ?? "-")")
+                if let owned = licensed, !owned.isEmpty, !owned.contains(refused) {
                     licenseSkipped.append(refused)
                     continue
                 }
